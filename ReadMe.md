@@ -14,6 +14,6 @@ Estimation of the area of applicability of the model (Meyer & Pebesma, 2021).
 
 Breiman, L. (2001). Random Forests. Machine Learning, 45, 5–32.
 
-Kursa, M., & Rudnicki, W. (2010). Feature selection with the Boruta Package. Journal of Statistical Software, 36(11), 1–11. http://www.jstatsoft.org/v36/i11/paper/
+Kursa, M. B., & Rudnicki, W. R. (2010). Feature Selection with the Boruta Package. Journal of Statistical Software, 36(11), 1–13. https://doi.org/10.18637/jss.v036.i11
 
 Meyer, H., & Pebesma, E. (2021). Predicting into unknown space? Estimating the area of applicability of spatial prediction models. Methods in Ecology and Evolution, 12(9), 1620–1633. https://doi.org/https://doi.org/10.1111/2041-210X.13650
