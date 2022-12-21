@@ -14,6 +14,8 @@ Mud (silt and clay) content of surface sediments on the Norwegian continental ma
 ## Install packages
 
 ```{r packages, message=FALSE, warning=FALSE}
+rm(list=ls())
+
 library(rgdal)
 library(raster)
 library(stars)
@@ -313,12 +315,10 @@ dist_env$plot + scale_x_log10()
 
 ## Distances in geographic space
 
-Since we’re using a global data set, we use *sampling = "Fibonacci"* to draw prediction locations with constant point density on the sphere.
-
 ```{r geogr_space_dist}
 dist_geogr <- plot_geodist(st_as_sf(GSM), predictors,
                      type = "geo",
-                     unit="km",
+                     #unit="km", # Requires CAST version >= 0.7.0
                      showPlot = FALSE)
 
 dist_geogr$plot
@@ -333,21 +333,11 @@ dist_geogr$plot + scale_x_log10()
 The spatial dependence structure in the raw data is determined. Specifically, the distance (range) up to which observations are spatially autocorrelated is estimated with a variogram.
 
 ```{r spatial_autocorrelation_range}
-# automap package
 vf <- autofitVariogram(alrM ~ 1, GSM
                        #, model = c("Sph", "Exp", "Gau", "Mat", "Ste")
                        )
 plot(vf)
 sar <- vf$var_model$range[2]
-
-# OR
-
-# gstat package
-#v <- variogram(alrM ~ 1, GSM, cutoff = 500000, width = 5000)
-#vf <- fit.variogram(v, vgm(c("Sph", "Exp", "Gau", "Mat", "Ste")))
-#plot(v, model=vf, xlab = "Distance (m)", ylab = "Semivariance")
-#sar <- vf$range[2]
-#print(paste0("SAC range = ", round(sar/1000, 3), " km"))
 ```
 
 
@@ -358,12 +348,14 @@ Spatial blocks and folds are created. The folds will be used in a spatial k-fold
 
 Roberts et. al. (2017) suggest that blocks should be substantially bigger than the range of spatial autocorrelation (in model residual) to obtain realistic error estimates, while a buffer with the size of the spatial autocorrelation range would result in a good estimation of error.
 
-*Should we increase the block size?*
+*Should we increase the block size? This could be gauged by looking at the geographic distances plot below. The block size might be right, when sample-to-prediction and CV distances look similar.*
 
 ```{r spatial_blocks}
+m <- 2.5 # Multiplier applied to block size
+
 spBlocks <- spatialBlock(GSM, 
                          rasterLayer = predictors[[1]], 
-                         theRange = sar*2.5, 
+                         theRange = sar * m, 
                          k = 10,
                          seed = 42,
                          progress = FALSE)
@@ -391,7 +383,7 @@ for (n in 1:spBlocks$k) {
 dist_geogr2 <- plot_geodist(st_as_sf(GSM), predictors,
                      cvfolds= index,
                      type = "geo",
-                     unit="km",
+                     #unit="km",  # Requires CAST version >= 0.7.0
                      showPlot = FALSE)
 
 dist_geogr2$plot
@@ -513,8 +505,6 @@ impfig
 
 ## Distances in environmental space including CV distances
 
-Since we’re using a global data set, we use *sampling = "Fibonacci"* to draw prediction locations with constant point density on the sphere.
-
 ```{r env_space_dist2}
 dist_env2 <- plot_geodist(st_as_sf(GSM), predictors,
                      type = "feature",
@@ -554,15 +544,23 @@ hist(mud, main = "", xlab = "Mud content (-)")
 ## Area of Applicability
 
 ```{r aoa}
-nCores <- detectCores()
+alrM_trainDI <- trainDI(model = model,
+                        variables = sel_preds)
+print(alrM_trainDI)
+
 cl <- makeCluster(nCores - 1)
 registerDoParallel(cl)
 
-AOA <- aoa(predictors[[sel_preds]], model, cl = cl)
+alrM_aoa <- aoa(newdata = predictors, 
+                model = model,
+                trainDI = alrM_trainDI,
+                variables = sel_preds,
+                cl = cl
+                )
 
 stopCluster(cl)
 
-plot(AOA)
+plot(alrM_aoa)
 ```
 
 
@@ -570,16 +568,29 @@ plot(AOA)
 
 ```{r plot_results}
 plot(mud)
-plot(AOA$DI)
-plot(AOA$AOA)
+plot(alrM_aoa$DI)
+plot(alrM_aoa$AOA)
+paste0("AOA = ", round(cellStats(alrM_aoa$AOA, stat = "mean"), 2))
 ```
+
+
+## Convert AOA from raster to polygon
+
+```{r aoa_poly}
+aoa_poly <- rasterToPolygons(alrM_aoa$AOA, dissolve = TRUE)
+plot(aoa_poly)
+
+writeOGR(aoa_poly, dsn = "output", layer = paste0("mud_aoa_", Sys.Date()), driver = "ESRI Shapefile")
+```
+
+
 
 
 ## Export geoTifs
 
 ```{r geotifs}
 writeRaster(mud, paste0("output/mud_", Sys.Date(), ".tif"))
-writeRaster(AOA$AOA, paste0("output/mud_aoa_", Sys.Date(), ".tif"))
+writeRaster(alrM_aoa$AOA, paste0("output/mud_aoa_", Sys.Date(), ".tif"))
 ```
 
 
@@ -594,7 +605,7 @@ print("Final Model")
 paste0("MSE = ", validation[1,1])
 paste0("RMSE = ", validation[1,2])
 paste0("R2 = ", validation[1,3])
-paste0("AOA = ", round(cellStats(AOA$AOA, stat = "mean"), 2))
+paste0("AOA = ", round(cellStats(alrM_aoa$AOA, stat = "mean"), 2))
 sink()
 ```
 
