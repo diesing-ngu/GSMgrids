@@ -180,7 +180,7 @@ centroids <- st_centroid(centroids)
 
 GSM_centr <- centroids
 
-plot(AoI$geometry)
+plot(predictors[[1]])
 plot(GSM_centr$geometry, pch = 20, add = TRUE)
 
 #write_sf(GSM_centr, "output/sample_centroids.shp")
@@ -347,7 +347,7 @@ Roberts et. al. (2017) suggest that blocks should be substantially bigger than t
 
 ```{r spatial_blocks, warning=FALSE}
 k <- 10 # Number of folds
-m <- 0.4 # Multiplier applied to block size
+m <- 1 # Multiplier applied to block size
 
 spBlocks <- spatialBlock(GSM_centr, 
                          rasterLayer = as(predictors[[1]], "Raster"), 
@@ -434,7 +434,7 @@ sel_preds <- model$selectedvars
 ```
 
 
-### FFS plot
+### FFS plot☺
 
 Plot of R2 over the model runs.
 
@@ -465,9 +465,10 @@ validation
 
 ## Validation plot
 
-```{r validation_plot}
+```{r validation_plot, message=FALSE}
 ggplot(t, aes(x = model.pred.pred, y = model.pred.obs)) +
   geom_hex(bins = 60) +
+  geom_smooth(method = "lm") +
   geom_abline(intercept = 0, slope = 1, colour = "grey", size = 1.2) +
   scale_fill_continuous(type = "viridis") +
   theme_bw() +
@@ -583,8 +584,8 @@ write_sf(st_as_sf(aoa_poly), dsn = "output", layer = paste0("mud_AOA_", Sys.Date
 ## Export geoTifs
 
 ```{r geotifs}
-raster::writeRaster(mud, paste0("output/mud_", Sys.Date(), ".tif"))
-raster::writeRaster(alrM_aoa$AOA, paste0("output/mud_aoa_", Sys.Date(), ".tif"))
+writeRaster(mud, paste0("output/mud_", Sys.Date(), ".tif"))
+writeRaster(alrM_aoa$AOA, paste0("output/mud_aoa_", Sys.Date(), ".tif"))
 ```
 
 
