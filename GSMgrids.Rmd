@@ -129,12 +129,6 @@ GSM <- GSM_data[,-c(1,3,7)] #Reduce to required columns
 summary(GSM)
 ```
 
-## Calculate additive log-ratio
-
-```{r calc_alr}
-GSM$alrM <- log(GSM$Mud/(GSM$Gravel + GSM$Sand))
-```
-
 
 ## Convert to spatial object
 
@@ -151,6 +145,80 @@ GSM <- rbind(GSM_ED50, GSM_WGS84)
 ```
 
 
+## Load categrorical data
+
+Additional categorical sample data are loaded, as coarse-grained sediments are undersampled in the dataset above.
+
+```{r load_categorical}
+cat_smple <- read_sf("input/MGObsPkt_150_160_170.shp")
+cat_smple <-  cat_smple[,c(13, 21)]
+cat_smple$Datum <- "WGS84"
+cat_smple$Mud <- 0
+cat_smple$Sand <- 0
+cat_smple$Gravel <- 0
+cat_smple$Sum <- 0
+cat_smple$Source <- "MAREANO"
+names(cat_smple)[1] <- "Station"
+summary(cat_smple)
+```
+
+
+## Add mud, sand and gravel percentages
+
+The sediment composition data is assigned randomly, but constrained to the respective fields in the Folk diagram.
+
+```{r add_gsm_pc}
+cat_smple <- as.data.frame(cat_smple)
+
+# Gravel content
+for (n in 1:nrow(cat_smple)) {
+  if(cat_smple[n,2] == 150|cat_smple[n,2] == 160) {
+    cat_smple[n,7] <- runif(n = 1, min = 30, max = 80)
+  } else {
+    cat_smple[n,7] <- runif(n = 1, min = 80, max = 100)
+  }
+}
+
+# Sand content
+for (n in 1:nrow(cat_smple)) {
+  if(cat_smple[n,2] == 150) {
+    cat_smple[n,6] <- runif(n = 1, min = (100 - as.numeric(cat_smple[n,7])) / 2, max = (9 * (100 - as.numeric(cat_smple[n,7])) / 10))
+  } else if(cat_smple[n,2] == 160) {
+    cat_smple[n,6] <- runif(n = 1, min = (9 * (100 - as.numeric(cat_smple[n,7]))) / 10, max = (100 - as.numeric(cat_smple[n,7])))
+  } else if(cat_smple[n,2] == 170) {
+    cat_smple[n,6] <- runif(n = 1, min = 0, max = (100 - as.numeric(cat_smple[n,7])))
+  }
+}
+
+# Mud content
+for (n in 1:nrow(cat_smple)) {
+  cat_smple[n,5] <- 100 - as.numeric(cat_smple[n,7]) - as.numeric(cat_smple[n,6])
+}
+
+# Sum
+for (n in 1:nrow(cat_smple)) {
+  cat_smple[n,8] <- as.numeric(cat_smple[n,7]) + as.numeric(cat_smple[n,6]) + as.numeric(cat_smple[n,5])
+}
+
+cat_smple <- cat_smple[c(1,4,5,6,7,8,9,3)]
+cat_smple <- st_as_sf(cat_smple)
+```
+
+
+## Combine both datasets
+
+```{r combine}
+GSM <- rbind(GSM, cat_smple)
+```
+
+
+## Calculate additive log-ratio
+
+```{r calc_alr}
+GSM$alrM <- log(GSM$Mud/(GSM$Gravel + GSM$Sand))
+```
+
+
 ## Clip to minimum extent
 
 ```{r clip_response}
@@ -164,6 +232,7 @@ Reproject to the previously defined projection.
 
 ```{r reproject}
 GSM <- st_transform(GSM, crs)
+write_sf(GSM, "output/GSM_samples.shp")
 ```
 
 
@@ -183,7 +252,7 @@ GSM_centr <- centroids
 plot(predictors[[1]])
 plot(GSM_centr$geometry, pch = 20, add = TRUE)
 
-#write_sf(GSM_centr, "output/sample_centroids.shp")
+write_sf(GSM_centr, "output/sample_centroids.shp", overwrite = TRUE)
 ```
 
 
@@ -347,7 +416,7 @@ Roberts et. al. (2017) suggest that blocks should be substantially bigger than t
 
 ```{r spatial_blocks, warning=FALSE}
 k <- 10 # Number of folds
-m <- 1 # Multiplier applied to block size
+m <- 0.12 # Multiplier applied to block size
 
 spBlocks <- spatialBlock(GSM_centr, 
                          rasterLayer = as(predictors[[1]], "Raster"), 
@@ -584,8 +653,8 @@ write_sf(st_as_sf(aoa_poly), dsn = "output", layer = paste0("mud_AOA_", Sys.Date
 ## Export geoTifs
 
 ```{r geotifs}
-writeRaster(mud, paste0("output/mud_", Sys.Date(), ".tif"))
-writeRaster(alrM_aoa$AOA, paste0("output/mud_aoa_", Sys.Date(), ".tif"))
+writeRaster(mud, paste0("output/mud_", Sys.Date(), ".tif"), overwrite = TRUE)
+writeRaster(alrM_aoa$AOA, paste0("output/mud_aoa_", Sys.Date(), ".tif"), overwrite = TRUE)
 ```
 
 
