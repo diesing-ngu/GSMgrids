@@ -85,7 +85,7 @@ if (crs(predictors) != crs) {
 ## Limit to predictors that are relevant for mapping grain-size
 
 ```{r limit_predictors}
-#predictors <- predictors[[c(1,2,3,4,5,10,11,24,25)]]
+predictors <- predictors[[-c(12,13,14,15,34,35,36,37)]]
 names(predictors)
 ```
 
@@ -125,6 +125,7 @@ fishnet$ID <- 1:nrow(fishnet)
 
 ```{r load_response}
 GSM_data <- read.csv("input/gsm_data.csv", header = TRUE, sep = ",")
+GSM_data <- subset(GSM_data, Station != "R1689") # Removal of a suspicious station
 GSM <- GSM_data[,-c(1,3,7)] #Reduce to required columns
 summary(GSM)
 ```
@@ -416,7 +417,7 @@ Roberts et. al. (2017) suggest that blocks should be substantially bigger than t
 
 ```{r spatial_blocks, warning=FALSE}
 k <- 10 # Number of folds
-m <- 0.12 # Multiplier applied to block size
+m <- 0.125 # Multiplier applied to block size
 
 spBlocks <- spatialBlock(GSM_centr, 
                          rasterLayer = as(predictors[[1]], "Raster"), 
