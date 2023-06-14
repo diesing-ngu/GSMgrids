@@ -7,7 +7,7 @@ output:
 
 # Introduction
 
-Mud (silt and clay) content of surface sediments on the Norwegian continental margin is spatially predicted based on observations (response variable) and predictor variables using random forests. 
+Gravel, sand and mud (silt and clay) contents of surface sediments on the Norwegian continental margin are spatially predicted based on observations (response variable) and predictor variables using random forests. 
 
 # Preparations
 
@@ -111,14 +111,6 @@ min_ext <- project(min_ext, "+proj=longlat +datum=WGS84 +no_defs")
 ```
 
 
-## Create a fishnet based on predictor raster
-
-```{r fishnet}
-fishnet <- st_as_sf(stars::st_as_stars(predictors[[1]]), as_points = FALSE, merge = FALSE)
-fishnet$ID <- 1:nrow(fishnet)
-```
-
-
 # Response variable
 
 ## Load response
@@ -171,6 +163,7 @@ The sediment composition data is assigned randomly, but constrained to the respe
 ```{r add_gsm_pc}
 cat_smple <- as.data.frame(cat_smple)
 
+set.seed(42)
 # Gravel content
 for (n in 1:nrow(cat_smple)) {
   if(cat_smple[n,2] == 150|cat_smple[n,2] == 160) {
@@ -213,10 +206,13 @@ GSM <- rbind(GSM, cat_smple)
 ```
 
 
-## Calculate additive log-ratio
+## Calculate additive log-ratios
+
+The mud, sand and gravel percentages are compositional data, i.e. each fraction is part of a total and is constrained between 0 and 1 and the three fractions must sum to 1 (or 100%). Because of this, each component should not be considered in isolation from the others. Here we followed recommendations of Aitchison (1986) and transformed the data onto the additive log-ratio scale where they can be analysed as two continuous, unconstrained response variables which can assume any value.
 
 ```{r calc_alr}
-GSM$alrM <- log(GSM$Mud/(GSM$Gravel + GSM$Sand))
+GSM$alrM <- log(GSM$Mud / GSM$Sand)
+GSM$alrG <- log(GSM$Gravel / GSM$Sand)
 ```
 
 
@@ -237,45 +233,28 @@ write_sf(GSM, "output/GSM_samples.shp")
 ```
 
 
-## Centroids
-
-```{r centroids}
-centroids <- st_join(fishnet, GSM)
-
-centroids <- na.omit(centroids)
-
-centroids <- centroids %>% group_by(ID) %>% summarize(alrM = mean(alrM, na.rm = TRUE))
-
-centroids <- st_centroid(centroids)
-
-GSM_centr <- centroids
-
-plot(predictors[[1]])
-plot(GSM_centr$geometry, pch = 20, add = TRUE)
-
-write_sf(GSM_centr, "output/sample_centroids.shp", overwrite = TRUE)
-```
-
-
-## Create a regression matrix
+## Create two regression matrices
 
 ```{r regression matrix}
-ov_gsm <- as.data.frame(extract(predictors, GSM_centr))
+ov_gsm <- as.data.frame(extract(predictors, GSM, ID = FALSE))
 
-rm_alrM <- cbind(GSM_centr$alrM, ov_gsm)
-
+rm_alrM <- cbind(GSM$alrM, ov_gsm)
 names(rm_alrM)[1] <- "alrM"
-
 summary(rm_alrM)
+
+rm_alrG <- cbind(GSM$alrG, ov_gsm)
+names(rm_alrG)[1] <- "alrG"
+summary(rm_alrG)
 ```
 
 
 ## Data exploration
 
-### alr-Mud
+### Histograms
 
-```{r hist_alrM}
+```{r hist}
 hist(rm_alrM$alrM, main = "", xlab = "alr-Mud")
+hist(rm_alrG$alrG, main = "", xlab = "alr-Gravel")
 ```
 
 
@@ -283,9 +262,7 @@ hist(rm_alrM$alrM, main = "", xlab = "alr-Mud")
 
 ## Boruta algorithm
 
-Although two models will be built, it is sufficient to run the Boruta algorithm only once, as the predictors and the sample locations are identical.
-
-```{r boruta}
+```{r boruta_alrm}
 set.seed(42)
 B <- Boruta(rm_alrM[[1]] ~ .,data = rm_alrM[2:ncol(rm_alrM)], pValue = 0.05,
              maxRuns = 500)
@@ -295,96 +272,78 @@ plot(B, las=2, colCode = c("greenyellow", "yellow2", "red3", "cadetblue"), xlab 
 ```
 
 
+```{r boruta_alrg}
+set.seed(42)
+B2 <- Boruta(rm_alrG[[1]] ~ .,data = rm_alrG[2:ncol(rm_alrG)], pValue = 0.05,
+             maxRuns = 500)
+B2
+par(mar=c(13,4,1,1), cex = 0.6)
+plot(B2, las=2, colCode = c("greenyellow", "yellow2", "red3", "cadetblue"), xlab = "")
+```
+
+
 ## De-correlation analysis
 
 To reduce redundancy in information, a de-correlation analysis is carried out. Of those predictor variables identified as important in the Boruta analysis, only those with a correlation coefficient below a set threshold are retained. However, a universally applicable threshold does not exist. Additionally, multicollinearity, i.e., collinearity between three or more variables, might exist in the data. Variance inflation factors (VIFs) are therefore additionally calculated to check for multicollinearity. As a rule of thumb, VIFs larger than 5 or 10 indicate a problematic amount of collinearity (James et al., 2017: pp. 101-102; doi: 10.1080/24754269.2021.1980261). According to Johnston et al. (2017; doi: 10.1007/s11135-017-0584-6) a VIF of 2.5 or greater is generally considered indicative of considerable collinearity.
 
-```{r de-corr, message=FALSE, warning=FALSE}
+```{r de-corr_alrm, message=FALSE, warning=FALSE}
 th <- 1
 
 repeat{
- cor_result<- vifcor(rm_alrM[rownames(subset(attStats(B), decision == "Confirmed"))], th = th,  maxobservations = nrow(rm_alrM))
- if (max(cor_result@results[,2]) >= 2.5){
+ cor_result_alrM <- vifcor(rm_alrM[rownames(subset(attStats(B), decision == "Confirmed"))], th = th,  maxobservations = nrow(rm_alrM))
+ if (max(cor_result_alrM@results[,2]) >= 2.5){
    th <- th - 0.01
  } else {
    break
  }
 }
 
-max(cor_result@results[,2])
-cor_result
+max(cor_result_alrM@results[,2])
+cor_result_alrM
 
-sel_preds <- cor_result@results$Variables
-seldata <- rm_alrM[c("alrM", sel_preds)]
+sel_preds_alrM <- cor_result_alrM@results$Variables
+seldata_alrM <- rm_alrM[c("alrM", sel_preds_alrM)]
 ```
 
 
-##  Correlation plot
+```{r de-corr_alrg, message=FALSE, warning=FALSE}
+th <- 1
 
-```{r correlation_plot}
-corrplot.mixed(cor(rm_alrM[sel_preds]), lower.col =  "black", tl.pos = "lt", number.cex = 0.6)
-```
-
-
-## Environmental space
-
-A visual check to what extent the samples cover the environmental space. This is useful as legacy data were used and no formal sampling design was applied in the analysis.
-
-* Blue: Samples
-
-* Grey: Environmental data (based on random subsample)
-
-```{r env_space}
-smp <- as.data.frame(spatSample(x = predictors[[sel_preds]], size = nrow((rm_alrM)), method = "random", na.rm = TRUE))
-
-for (i in 2:ncol(seldata)) {
-    
-  print(ggplot() +
-          geom_density(data = seldata, aes(x=seldata[,i]),
-          colour = "cornflowerblue", fill = "cornflowerblue", alpha = 0.1,linewidth = 1) +
-          geom_density(data = smp, aes(x = smp[,i-1]), colour = "grey",fill = "grey", alpha = 0.1, linewidth = 1) +
-          scale_x_continuous(name = names(seldata[i])) +
-          theme_bw())
-        
+repeat{
+ cor_result_alrG <- vifcor(rm_alrG[rownames(subset(attStats(B2), decision == "Confirmed"))], th = th,  maxobservations = nrow(rm_alrG))
+ if (max(cor_result_alrG@results[,2]) >= 2.5){
+   th <- th - 0.01
+ } else {
+   break
+ }
 }
+
+max(cor_result_alrG@results[,2])
+cor_result_alrG
+
+sel_preds_alrG <- cor_result_alrG@results$Variables
+seldata_alrG <- rm_alrG[c("alrG", sel_preds_alrG)]
 ```
 
 
-## 2D plots of environmental space
+##  Correlation plots
 
-```{r 2d_env_plots}
-
-for (i in sel_preds[2:length(sel_preds)]) {
-  
-  print(ggplot() +
-    geom_point(data = smp, aes(x = smp[,i], y = smp[,1]), colour = "grey", alpha = 1, size = 2) +
-    geom_point(data = seldata, aes(x = seldata[,i], y = seldata[,2]), colour = "cornflowerblue", alpha = 1, size = 2) +
-    scale_x_continuous(name = names(seldata[i]))+
-    ylab(sel_preds[1]) +
-    theme_bw())
-}
+```{r correlation_plot_alrm}
+corrplot.mixed(cor(rm_alrM[sel_preds_alrM]), lower.col =  "black", tl.pos = "lt", number.cex = 0.6)
 ```
 
 
-## Distances in environmental space 
-
-```{r env_space_dist}
-dist_env <- plot_geodist(GSM_centr, predictors,
-                     type = "feature",
-                     variables = sel_preds,
-                     showPlot = FALSE)
-
-dist_env$plot
-dist_env$plot + scale_x_log10()
+```{r correlation_plot_alrs}
+corrplot.mixed(cor(rm_alrG[sel_preds_alrG]), lower.col =  "black", tl.pos = "lt", number.cex = 0.6)
 ```
 
 
 ## Distances in geographic space
 
 ```{r geogr_space_dist, message=FALSE}
-dist_geogr <- plot_geodist(GSM_centr, predictors,
+dist_geogr <- plot_geodist(GSM, predictors,
                      type = "geo",
-                     unit = "km", # Requires CAST version >= 0.7.0
+                     unit = "km",
                      showPlot = FALSE)
 
 dist_geogr$plot
@@ -394,16 +353,21 @@ dist_geogr$plot + scale_x_log10()
 
 # Random Forest model
 
-## Spatial autocorrelation range
+## Spatial autocorrelation ranges
 
 The spatial dependence structure in the raw data is determined. Specifically, the distance (range) up to which observations are spatially autocorrelated is estimated with a variogram.
 
-```{r spatial_autocorrelation_range}
-vf <- autofitVariogram(alrM ~ 1, as(GSM_centr, "Spatial")
-                       #, model = c("Sph", "Exp", "Gau", "Mat", "Ste")
-                       )
-plot(vf)
-sar <- vf$var_model$range[2]
+```{r spatial_autocorrelation_range_alrm}
+vf_alrM <- autofitVariogram(alrM ~ 1, GSM)
+plot(vf_alrM)
+sar_alrM <- vf_alrM$var_model$range[2]
+```
+
+
+```{r spatial_autocorrelation_range_alrg}
+vf_alrG <- autofitVariogram(alrG ~ 1, GSM)
+plot(vf_alrG)
+sar_alrG <- vf_alrG$var_model$range[2]
 ```
 
 
@@ -415,18 +379,29 @@ Roberts et. al. (2017) suggest that blocks should be substantially bigger than t
 
 *Should we increase the block size? This could be gauged by looking at the geographic distances plot below. The block size might be right, when sample-to-prediction and CV distances look similar.*
 
-```{r spatial_blocks, warning=FALSE}
+```{r spatial_blocks_alrm, warning=FALSE}
 k <- 10 # Number of folds
-m <- 0.125 # Multiplier applied to block size
+m <- 1 # Multiplier applied to block size
 
-spBlocks <- spatialBlock(GSM_centr, 
-                         rasterLayer = as(predictors[[1]], "Raster"), 
-                         theRange = sar * m, 
-                         k = k,
-                         seed = 42,
-                         progress = FALSE)
+spBlocks_alrM <- cv_spatial(x = GSM,
+                       k = k,
+                       #hexagon = FALSE,
+                       size = sar_alrM * m,
+                       seed = 42,
+                       progress = FALSE)
+```
 
-#write_sf(spBlocks$blocks, "output/spBlocks.shp")
+
+```{r spatial_blocks_alrg, warning=FALSE}
+k <- 10 # Number of folds
+m <- 0.5 # Multiplier applied to block size
+
+spBlocks_alrG <- cv_spatial(x = GSM,
+                       k = k,
+                       #hexagon = FALSE,
+                       size = sar_alrG * m,
+                       seed = 42,
+                       progress = FALSE)
 ```
 
 
@@ -434,26 +409,55 @@ spBlocks <- spatialBlock(GSM_centr,
 
 The output from the blocking step needs to be reshaped.
 
-```{r reshape_index}
-index <- list()
-for (n in 1:spBlocks$k) {
-  f <- spBlocks[["folds"]][[n]][[-2]]
-  index[[length(index)+1]] <- f
+```{r reshape_index_alrm}
+index_train_alrM <- list()
+index_val_alrM <- list()
+for (n in 1:spBlocks_alrM$k) {
+  ft <- spBlocks_alrM[["folds_list"]][[n]][[-2]]
+  fv <- spBlocks_alrM[["folds_list"]][[n]][[2]]
+  index_train_alrM[[length(index_train_alrM)+1]] <- ft
+  index_val_alrM[[length(index_val_alrM)+1]] <- fv
 }
 ```
 
 
+
+```{r reshape_index_alrg}
+index_train_alrG <- list()
+index_val_alrG <- list()
+for (n in 1:spBlocks_alrG$k) {
+  ft <- spBlocks_alrG[["folds_list"]][[n]][[-2]]
+  fv <- spBlocks_alrG[["folds_list"]][[n]][[2]]
+  index_train_alrG[[length(index_train_alrG)+1]] <- ft
+  index_val_alrG[[length(index_val_alrG)+1]] <- fv
+}
+```
+
+
+
 ## Distances in geographic space including CV distances
 
-```{r geogr_space_dist2}
-dist_geogr2 <- plot_geodist(GSM_centr, predictors,
-                     cvfolds= index,
+```{r geogr_space_dist_alrm, warning=FALSE}
+dist_geogr_alrM <- plot_geodist(GSM, predictors,
+                     cvfolds= index_val_alrM,
                      type = "geo",
-                     unit="km",  # Requires CAST version >= 0.7.0
+                     unit="km",
                      showPlot = FALSE)
 
-dist_geogr2$plot
-dist_geogr2$plot + scale_x_log10()
+dist_geogr_alrM$plot
+dist_geogr_alrM$plot + scale_x_log10()
+```
+
+
+```{r geogr_space_dist_alrg, warning=FALSE}
+dist_geogr_alrG <- plot_geodist(GSM, predictors,
+                     cvfolds= index_val_alrG,
+                     type = "geo",
+                     unit="km",
+                     showPlot = FALSE)
+
+dist_geogr_alrG$plot
+dist_geogr_alrG$plot + scale_x_log10()
 ```
 
 
@@ -466,7 +470,9 @@ This step is time-consuming and memory-heavy. Therefore, only a subset of possib
 The maximum number of iterations can be calculated upfront, based on the number of pre-selected predictors:
 
 ```{r max_iter}
-factorial(length(sel_preds))/(factorial(2)*factorial(length(sel_preds)-2)) + sum(c((length(sel_preds)-2):1))
+factorial(length(sel_preds_alrM))/(factorial(2)*factorial(length(sel_preds_alrM)-2)) + sum(c((length(sel_preds_alrM)-2):1))
+
+factorial(length(sel_preds_alrG))/(factorial(2)*factorial(length(sel_preds_alrG)-2)) + sum(c((length(sel_preds_alrG)-2):1))
 ```
 
 
@@ -474,42 +480,73 @@ factorial(length(sel_preds))/(factorial(2)*factorial(length(sel_preds)-2)) + sum
 
 The best combination of predictor variables (features) is found in a forward feature selection process.
 
-
-```{r model_tuning}
+```{r model_tuning_alrm}
 nCores <- detectCores()
 cl <- makePSOCKcluster(nCores - 1)
 registerDoParallel(cl)
 
 set.seed(42)
 
-model <- ffs(seldata[sel_preds],
-               seldata$alrM,
+model_alrM <- ffs(seldata_alrM[sel_preds_alrM],
+               seldata_alrM$alrM,
                metric = "Rsquared",
                method="rf",
                replace = FALSE,
                importance = TRUE,
-               #tuneGrid = expand.grid(mtry =  round(floor(sqrt(length(sel_preds)))*c(1,1.5,2,3))),
                trControl = trainControl(method="CV",
                                         number = k,
                                         savePredictions = "final",
-                                        index = index, 
+                                        index = index_train_alrM, 
                                         allowParallel = TRUE),
                verbose = TRUE)
 
 stopCluster(cl)
 
-model
+model_alrM
 
-sel_preds <- model$selectedvars
+sel_preds_alrM <- model_alrM$selectedvars
 ```
 
 
-### FFS plot☺
+```{r model_tuning_alrG}
+nCores <- detectCores()
+cl <- makePSOCKcluster(nCores - 1)
+registerDoParallel(cl)
+
+set.seed(42)
+
+model_alrG <- ffs(seldata_alrG[sel_preds_alrG],
+               seldata_alrG$alrG,
+               metric = "Rsquared",
+               method="rf",
+               replace = FALSE,
+               importance = TRUE,
+               trControl = trainControl(method="CV",
+                                        number = k,
+                                        savePredictions = "final",
+                                        index = index_train_alrG, 
+                                        allowParallel = TRUE),
+               verbose = TRUE)
+
+stopCluster(cl)
+
+model_alrG
+
+sel_preds_alrG <- model_alrG$selectedvars
+```
+
+
+### FFS plots
 
 Plot of R2 over the model runs.
 
-```{r ffs_plot}
-plot_ffs(model)
+```{r ffs_plot_alrM}
+plot_ffs(model_alrM)
+```
+
+
+```{r ffs_plot_alrg}
+plot_ffs(model_alrG)
 ```
 
 
@@ -519,27 +556,54 @@ The validation results of the optimal RF model.
 
 Note that these are the statistics based on the predicted values of the selected model. These differ slightly from the values from the tuning (above), which are the means of the k predictions based on the folds.
 
-```{r validation_stats}
-t <- data.frame(model$pred$pred, model$pred$obs)
+```{r validation_stats_alrm}
+t_alrM <- data.frame(model_alrM$pred$pred, model_alrM$pred$obs)
 
-validation <- data.frame(mse=numeric(), rmse=numeric(), r2=numeric())
-validation[1,1] <- round(mse(t$model.pred.obs, t$model.pred.pred), 3)
-validation[1,2] <- round(rmse(t$model.pred.obs, t$model.pred.pred), 3)
-validation[1,3] <- round(cor(t$model.pred.obs, t$model.pred.pred)^2, 3)
+validation_alrM <- data.frame(mse=numeric(), rmse=numeric(), r2=numeric())
+validation_alrM[1,1] <- round(mse(t_alrM$model_alrM.pred.obs, t_alrM$model_alrM.pred.pred), 3)
+validation_alrM[1,2] <- round(rmse(t_alrM$model_alrM.pred.obs, t_alrM$model_alrM.pred.pred), 3)
+validation_alrM[1,3] <- round(cor(t_alrM$model_alrM.pred.obs, t_alrM$model_alrM.pred.pred)^2, 3)
 
-colnames(validation) <- c("MSE", "RMSE", "r2")
-rownames(validation) <- NULL
-validation
+colnames(validation_alrM) <- c("MSE", "RMSE", "r2")
+rownames(validation_alrM) <- NULL
+validation_alrM
 ```
 
 
-## Validation plot
+```{r validation_stats_alrG}
+t_alrG <- data.frame(model_alrG$pred$pred, model_alrG$pred$obs)
 
-```{r validation_plot, message=FALSE}
-ggplot(t, aes(x = model.pred.pred, y = model.pred.obs)) +
+validation_alrG <- data.frame(mse=numeric(), rmse=numeric(), r2=numeric())
+validation_alrG[1,1] <- round(mse(t_alrG$model_alrG.pred.obs, t_alrG$model_alrG.pred.pred), 3)
+validation_alrG[1,2] <- round(rmse(t_alrG$model_alrG.pred.obs, t_alrG$model_alrG.pred.pred), 3)
+validation_alrG[1,3] <- round(cor(t_alrG$model_alrG.pred.obs, t_alrG$model_alrG.pred.pred)^2, 3)
+
+colnames(validation_alrG) <- c("MSE", "RMSE", "r2")
+rownames(validation_alrG) <- NULL
+validation_alrG
+```
+
+
+## Validation plots
+
+```{r validation_plot_alrM, message=FALSE}
+ggplot(t_alrM, aes(x = model_alrM.pred.pred, y = model_alrM.pred.obs)) +
   geom_hex(bins = 60) +
   geom_smooth(method = "lm") +
-  geom_abline(intercept = 0, slope = 1, colour = "grey", size = 1.2) +
+  geom_abline(intercept = 0, slope = 1, colour = "grey", linewidth = 1.2) +
+  scale_fill_continuous(type = "viridis") +
+  theme_bw() +
+  scale_x_continuous(name = "Predicted value") +
+  scale_y_continuous(name = "Observed value")
+       
+```
+
+
+```{r validation_plot_alrG, message=FALSE}
+ggplot(t_alrG, aes(x = model_alrG.pred.pred, y = model_alrG.pred.obs)) +
+  geom_hex(bins = 60) +
+  geom_smooth(method = "lm") +
+  geom_abline(intercept = 0, slope = 1, colour = "grey", linewidth = 1.2) +
   scale_fill_continuous(type = "viridis") +
   theme_bw() +
   scale_x_continuous(name = "Predicted value") +
@@ -550,8 +614,8 @@ ggplot(t, aes(x = model.pred.pred, y = model.pred.obs)) +
 
 ## Variable importance
 
-```{r variable_importance_plot}
-imp <- varImp(model$finalModel)
+```{r variable_importance_plot_alrm}
+imp <- varImp(model_alrM$finalModel)
 imp$Predictor <- rownames(imp)
 rownames(imp) <- NULL
 imp <- imp[order(imp[1], decreasing = TRUE), c(2, 1)]
@@ -571,66 +635,73 @@ impfig
 ```
 
 
-## Distances in environmental space including CV distances
+```{r variable_importance_plot_alrg}
+imp <- varImp(model_alrG$finalModel)
+imp$Predictor <- rownames(imp)
+rownames(imp) <- NULL
+imp <- imp[order(imp[1], decreasing = TRUE), c(2, 1)]
+colnames(imp)[2] <- "IncMSE"
+imp
 
-```{r env_space_dist2}
-dist_env2 <- plot_geodist(GSM_centr, predictors,
-                     type = "feature",
-                     cvfolds= index,
-                     variables = sel_preds,
-                     showPlot = FALSE)
-
-dist_env2$plot
-dist_env2$plot + scale_x_log10()
-```
-
-
-
-## Partial dependence
-
-Partial dependence plots give a graphical depiction of the marginal effect of a variable on the response.
-
-```{r partial_plots}
-for (i in 1:length(sel_preds)) {
-  partialPlot(x = model$finalModel, pred.data = seldata, x.var = sel_preds[i], main = "", xlab = sel_preds[i], ylab = "alr-Mud (-)")
-}
+impfig <- imp %>%
+  mutate(Predictor = fct_reorder(Predictor, IncMSE)) %>%
+  ggplot( aes(x=Predictor, y=IncMSE)) +
+    geom_bar(stat="identity", fill="#f68060", alpha=.6, width=.4) +
+    coord_flip() +
+    xlab("") +
+    ylab("% increase in MSE") +
+    theme_bw()
+    
+impfig
 ```
 
 
 # Predict RF model
 
-## Predict mud content
+## Predict alrM and alrG
 
-```{r predict_mud}
-preds <- stack(predictors[[sel_preds]])
-alrM <- predict(preds, model$finalModel)
-
-mud <- exp(alrM)/(exp(alrM) + 1)
-hist(mud, main = "", xlab = "Mud content (-)")
+```{r predict_alr}
+alrM <- rast(predict(stack(predictors[[sel_preds_alrM]]), model_alrM$finalModel))
+alrG <- rast(predict(stack(predictors[[sel_preds_alrG]]), model_alrG$finalModel))
 ```
 
 
 ## Area of Applicability
 
-```{r aoa}
-alrM_trainDI <- trainDI(model = model,
-                        variables = sel_preds)
+```{r aoa_alrm}
+alrM_trainDI <- trainDI(model = model_alrM,
+                        variables = sel_preds_alrM)
 print(alrM_trainDI)
 
 alrM_aoa <- aoa(newdata = predictors, 
-                model = model,
+                model = model_alrM,
                 trainDI = alrM_trainDI,
-                variables = sel_preds,
+                variables = sel_preds_alrM,
                 )
 
 plot(alrM_aoa)
 ```
 
 
+```{r aoa_alrg}
+alrG_trainDI <- trainDI(model = model_alrG,
+                        variables = sel_preds_alrG)
+print(alrG_trainDI)
+
+alrG_aoa <- aoa(newdata = predictors, 
+                model = model_alrG,
+                trainDI = alrG_trainDI,
+                variables = sel_preds_alrG,
+                )
+
+plot(alrG_aoa)
+```
+
+
 ## Plot results
 
-```{r plot_results}
-plot(mud)
+```{r plot_results_alrm}
+plot(alrM)
 plot(alrM_aoa$DI)
 plot(alrM_aoa$AOA)
 
@@ -639,51 +710,77 @@ print(paste0("AOA = ", round(100*fr$count[2]/ sum(fr$count),2), "% of pixels"))
 ```
 
 
-## Convert AOA from raster to polygon
+```{r plot_results_alrg}
+plot(alrG)
+plot(alrG_aoa$DI)
+plot(alrG_aoa$AOA)
 
-```{r aoa_poly}
-aoa_poly <- as.polygons(alrM_aoa$AOA, dissolve = TRUE)
-plot(aoa_poly)
-
-write_sf(st_as_sf(aoa_poly), dsn = "output", layer = paste0("mud_AOA_", Sys.Date()), driver = "ESRI Shapefile")
+fr2 <- freq(alrG_aoa$AOA)
+print(paste0("AOA = ", round(100*fr2$count[2]/ sum(fr2$count),2), "% of pixels"))
 ```
 
 
+## Back-transformation
+
+The predicted additive log-ratios are back-transformed to mud, sand and gravel contents. Note that this leads to fractional contents ranging between 0 and 1.
+
+```{r back-transform}
+mud <- exp(alrM) / (exp(alrM) + exp(alrG) + 1)
+gravel <- exp(alrG) / (exp(alrM) + exp(alrG) + 1)
+sand <- 1 - (mud + gravel)
+
+hist(mud, main = "", xlab = "Mud content (-)")
+hist(sand, main = "", xlab = "Sand content (-)")
+hist(gravel, main = "", xlab = "Gravel content (-)")
+```
+
+
+## Plot GSM
+
+```{r plot_gsm}
+plot(mud)
+plot(sand)
+plot(gravel)
+```
 
 
 ## Export geoTifs
 
 ```{r geotifs}
 writeRaster(mud, paste0("output/mud_", Sys.Date(), ".tif"), overwrite = TRUE)
-writeRaster(alrM_aoa$AOA, paste0("output/mud_aoa_", Sys.Date(), ".tif"), overwrite = TRUE)
+writeRaster(sand, paste0("output/sand_", Sys.Date(), ".tif"), overwrite = TRUE)
+writeRaster(gravel, paste0("output/gravel_", Sys.Date(), ".tif"), overwrite = TRUE)
 ```
 
 
 ## Output a log file
 
 ```{r log}
-sink(file = paste0("output/ModelLog_", Sys.Date(), ".txt"))
+sink(file = paste0("output/ModelLog_alrM_", Sys.Date(), ".txt"))
 print("Selected Predictors")
-sel_preds
-model
+sel_preds_alrM
+model_alrM
 print("Final Model")
-paste0("MSE = ", validation[1,1])
-paste0("RMSE = ", validation[1,2])
-paste0("R2 = ", validation[1,3])
+paste0("MSE = ", validation_alrM[1,1])
+paste0("RMSE = ", validation_alrM[1,2])
+paste0("R2 = ", validation_alrM[1,3])
 paste0("AOA = ", round(100*fr$count[2]/ sum(fr$count),2), "% of pixels")
+sink()
+
+sink(file = paste0("output/ModelLog_alrG_", Sys.Date(), ".txt"))
+print("Selected Predictors")
+sel_preds_alrG
+model_alrG
+print("Final Model")
+paste0("MSE = ", validation_alrG[1,1])
+paste0("RMSE = ", validation_alrG[1,2])
+paste0("R2 = ", validation_alrG[1,3])
+paste0("AOA = ", round(100*fr2$count[2]/ sum(fr2$count),2), "% of pixels")
 sink()
 ```
 
 
 # Finishing off
-
-
-# Save RF model
-
-```{r save_model}
-saveRDS(model, "rfmodel.rds")
-```
-
 
 ## Save session info
 
