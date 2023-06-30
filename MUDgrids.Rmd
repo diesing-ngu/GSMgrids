@@ -1,0 +1,605 @@
+---
+title: "MUDgrids"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Introduction
+
+Mud (silt and clay) contents of surface sediments on the Norwegian continental margin are spatially predicted based on observations (response variable) and predictor variables using random forests. 
+
+# Preparations
+
+## Install packages
+
+```{r packages, message=FALSE, warning=FALSE}
+rm(list=ls())
+
+library(raster)
+library(terra)
+library(stars)
+library(Boruta)
+library(caret)
+library(usdm)
+library(corrplot)
+library(ggplot2)
+library(sf)
+library(CAST)
+library(randomForest)
+library(blockCV)
+library(automap)
+library(gstat)
+library(foreach)
+library(doParallel)
+library(ModelMetrics)
+library(forcats)
+library(dplyr)
+```
+
+
+## Define projection and resolution
+
+Projection based on https://projectionwizard.org/ using the AoI.
+
+*Is it possible to automate the selection of the CSR based on the AoI?*
+
+```{r projection}
+crs <- "+proj=laea +lat_0=90 +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs" 
+res <- 4000
+```
+
+
+## Define Area of Interest (AoI)
+
+The area of interest is defined by the predicted sediment classes. Rocks and boulders (50) define areas outside the AoI.
+
+*Make sure to load the most up-to-date version of predicted sediment classes*
+
+```{r aoi}
+AoI <- rast("N:/Prosjekter/311700_MAREANO/311778_Automatisert_kartlegging/Kornstørrelse/R/GrainSize/output/GrainSizeReg_folk8_classes_2023-06-28.tif")
+AoI[AoI == 11] <- 1
+AoI[AoI == 12] <- 1
+AoI[AoI == 13] <- 1
+AoI[AoI == 20] <- 1
+AoI[AoI == 30] <- 1
+AoI[AoI == 40] <- 1
+AoI[AoI == 50] <- NA
+AoI[AoI == 60] <- 1
+
+AoI <- as.polygons(AoI, dissolve = TRUE)
+```
+
+
+# Predictor variables
+
+## Load raster stack with predictor variables
+
+```{r load_predictors}
+predictors <- rast("input/predictors_ngb.tif")
+grainsize_prob <- extend(rast("N:/Prosjekter/311700_MAREANO/311778_Automatisert_kartlegging/Kornstørrelse/R/Grainsize/output/GrainSizeReg_folk8_probabilities_2023-06-28.tif"), predictors)
+predictors <- c(predictors, grainsize_prob)
+names(predictors)[38] <- "M"
+names(predictors)[39] <- "sM"
+names(predictors)[40] <- "mS"
+names(predictors)[41] <- "S"
+names(predictors)[42] <- "CS"
+names(predictors)[43] <- "Mx"
+names(predictors)[44] <- "R"
+names(predictors)[45] <- "Mos"
+```
+
+
+## Ensure uniform projection
+
+Check if AoI and predictors have the defined projection. Re-project if this is not the case.
+
+```{r}
+if (st_crs(AoI)$proj4string != crs) {
+  AoI <- st_transform(AoI, crs)
+}
+
+if (crs(predictors) != crs) {
+  predictors <- project(predictors, crs, res = res)
+}
+```
+
+## Limit to predictors that are relevant for mapping grain-size
+
+```{r limit_predictors}
+predictors <- predictors[[-44]]
+#predictors <- predictors[[-c(12,13,14,15,34,35,36,37,44)]]
+names(predictors)
+```
+
+
+## Crop predictors to AoI
+
+```{r crop_predictors}
+predictors <- crop(mask(predictors, AoI, touches = FALSE), AoI)
+plot(predictors)
+```
+
+
+## Minimum extent
+
+Create a  spatial polygon giving the minimum extent of all predictors. This will be used to limit the response data to those points for which predictor variable data can be extracted.
+
+```{r min_extent}
+min_ext <- sum(predictors)
+min_ext[min_ext > 0] <- 1
+min_ext <- as.polygons(min_ext, dissolve = TRUE)
+min_ext <- project(min_ext, "+proj=longlat +datum=WGS84 +no_defs")
+```
+
+
+# Response variable
+
+## Load response
+
+```{r load_response}
+GSM_data <- read.csv("input/gsm_data.csv", header = TRUE, sep = ",")
+GSM_data <- subset(GSM_data, Station != "R1689") # Removal of a suspicious station
+GSM <- GSM_data[,-c(1,3,7)] #Reduce to required columns
+summary(GSM)
+```
+
+
+## Convert to spatial object
+
+```{r convert_to_spatial}
+GSM_ED50 <- subset(GSM, Datum == "ED50")
+GSM_WGS84 <- subset(GSM, Datum == "WGS84")
+
+GSM_ED50 <- st_as_sf(GSM_ED50, coords = c(3:4), crs = CRS("+proj=longlat +ellps=intl +no_defs"))
+GSM_ED50 <- st_transform(GSM_ED50, "+proj=longlat +datum=WGS84 +no_defs")
+
+GSM_WGS84 <- st_as_sf(GSM_WGS84, coords = c(3:4), crs = CRS("+proj=longlat +datum=WGS84 +no_defs"))
+
+GSM <- rbind(GSM_ED50, GSM_WGS84)
+```
+
+
+## Load categrorical data
+
+Additional categorical sample data are loaded, as coarse-grained sediments are undersampled in the dataset above.
+
+```{r load_categorical}
+cat_smple <- read_sf("input/MGObsPkt_150_160_170.shp")
+cat_smple <-  cat_smple[,c(13, 21)]
+cat_smple$Datum <- "WGS84"
+cat_smple$Mud <- 0
+cat_smple$Sand <- 0
+cat_smple$Gravel <- 0
+cat_smple$Sum <- 0
+cat_smple$Source <- "MAREANO"
+names(cat_smple)[1] <- "Station"
+summary(cat_smple)
+```
+
+
+## Add mud, sand and gravel percentages
+
+The sediment composition data is assigned randomly, but constrained to the respective fields in the Folk diagram.
+
+```{r add_gsm_pc}
+cat_smple <- as.data.frame(cat_smple)
+
+set.seed(42)
+# Gravel content
+for (n in 1:nrow(cat_smple)) {
+  if(cat_smple[n,2] == 150|cat_smple[n,2] == 160) {
+    cat_smple[n,7] <- runif(n = 1, min = 30, max = 80)
+  } else {
+    cat_smple[n,7] <- runif(n = 1, min = 80, max = 100)
+  }
+}
+
+# Sand content
+for (n in 1:nrow(cat_smple)) {
+  if(cat_smple[n,2] == 150) {
+    cat_smple[n,6] <- runif(n = 1, min = (100 - as.numeric(cat_smple[n,7])) / 2, max = (9 * (100 - as.numeric(cat_smple[n,7])) / 10))
+  } else if(cat_smple[n,2] == 160) {
+    cat_smple[n,6] <- runif(n = 1, min = (9 * (100 - as.numeric(cat_smple[n,7]))) / 10, max = (100 - as.numeric(cat_smple[n,7])))
+  } else if(cat_smple[n,2] == 170) {
+    cat_smple[n,6] <- runif(n = 1, min = 0, max = (100 - as.numeric(cat_smple[n,7])))
+  }
+}
+
+# Mud content
+for (n in 1:nrow(cat_smple)) {
+  cat_smple[n,5] <- 100 - as.numeric(cat_smple[n,7]) - as.numeric(cat_smple[n,6])
+}
+
+# Sum
+for (n in 1:nrow(cat_smple)) {
+  cat_smple[n,8] <- as.numeric(cat_smple[n,7]) + as.numeric(cat_smple[n,6]) + as.numeric(cat_smple[n,5])
+}
+
+cat_smple <- cat_smple[c(1,4,5,6,7,8,9,3)]
+cat_smple <- st_as_sf(cat_smple)
+```
+
+
+## Combine both datasets
+
+```{r combine}
+GSM <- rbind(GSM, cat_smple)
+```
+
+
+## Calculate additive log-ratio
+
+The mud, sand and gravel percentages are compositional data, i.e. each fraction is part of a total and is constrained between 0 and 1 and the three fractions must sum to 1 (or 100%). Because of this, each component should not be considered in isolation from the others. Here we followed recommendations of Aitchison (1986) and transformed the data onto the additive log-ratio scale where they can be analysed as two continuous, unconstrained response variables which can assume any value.
+
+```{r calc_alr}
+GSM$alrM <- log(GSM$Mud / (GSM$Sand + GSM$Gravel))
+```
+
+
+## Clip to minimum extent
+
+```{r clip_response}
+GSM <- st_intersection(GSM, st_as_sf(min_ext))
+```
+
+
+## Reproject
+
+Reproject to the previously defined projection.
+
+```{r reproject}
+GSM <- st_transform(GSM, crs)
+write_sf(GSM, "output/GSM_samples.shp")
+```
+
+
+## Create a regression matrix
+
+```{r regression matrix}
+ov_gsm <- as.data.frame(extract(predictors, GSM, ID = FALSE))
+
+rm_alrM <- cbind(GSM$alrM, ov_gsm)
+names(rm_alrM)[1] <- "alrM"
+summary(rm_alrM)
+```
+
+
+## Data exploration
+
+### Histograms
+
+```{r hist}
+hist(rm_alrM$alrM, main = "", xlab = "alr-Mud")
+```
+
+
+# Predictor variable pre-selection
+
+## Boruta algorithm
+
+```{r boruta_alrm}
+set.seed(42)
+B <- Boruta(rm_alrM[[1]] ~ .,data = rm_alrM[2:ncol(rm_alrM)], pValue = 0.05,
+             maxRuns = 500)
+B
+par(mar=c(13,4,1,1), cex = 0.6)
+plot(B, las=2, colCode = c("greenyellow", "yellow2", "red3", "cadetblue"), xlab = "")
+```
+
+
+## De-correlation analysis
+
+To reduce redundancy in information, a de-correlation analysis is carried out. Of those predictor variables identified as important in the Boruta analysis, only those with a correlation coefficient below a set threshold are retained. However, a universally applicable threshold does not exist. Additionally, multicollinearity, i.e., collinearity between three or more variables, might exist in the data. Variance inflation factors (VIFs) are therefore additionally calculated to check for multicollinearity. As a rule of thumb, VIFs larger than 5 or 10 indicate a problematic amount of collinearity (James et al., 2017: pp. 101-102; doi: 10.1080/24754269.2021.1980261). According to Johnston et al. (2017; doi: 10.1007/s11135-017-0584-6) a VIF of 2.5 or greater is generally considered indicative of considerable collinearity.
+
+```{r de-corr_alrm, message=FALSE, warning=FALSE}
+th <- 1
+
+repeat{
+ cor_result_alrM <- vifcor(rm_alrM[rownames(subset(attStats(B), decision == "Confirmed"))], th = th,  maxobservations = nrow(rm_alrM))
+ if (max(cor_result_alrM@results[,2]) >= 2.5){
+   th <- th - 0.01
+ } else {
+   break
+ }
+}
+
+max(cor_result_alrM@results[,2])
+cor_result_alrM
+
+sel_preds_alrM <- cor_result_alrM@results$Variables
+seldata_alrM <- rm_alrM[c("alrM", sel_preds_alrM)]
+```
+
+
+##  Correlation plots
+
+```{r correlation_plot_alrm}
+corrplot.mixed(cor(rm_alrM[sel_preds_alrM]), lower.col =  "black", tl.pos = "lt", number.cex = 0.6)
+```
+
+
+## Distances in geographic space
+
+```{r geogr_space_dist, message=FALSE}
+dist_geogr <- plot_geodist(GSM, predictors,
+                     type = "geo",
+                     unit = "km",
+                     showPlot = FALSE)
+
+dist_geogr$plot
+dist_geogr$plot + scale_x_log10()
+```
+
+
+# Random Forest model
+
+## Spatial autocorrelation ranges
+
+The spatial dependence structure in the raw data is determined. Specifically, the distance (range) up to which observations are spatially autocorrelated is estimated with a variogram.
+
+```{r spatial_autocorrelation_range_alrm}
+vf_alrM <- autofitVariogram(alrM ~ 1, GSM)
+plot(vf_alrM)
+sar_alrM <- vf_alrM$var_model$range[2]
+```
+
+
+## Creating spatial blocks
+
+Spatial blocks and folds are created. The folds will be used in a spatial k-fold cross validation. The size of the blocks is determined by the spatial autocorrelation range.
+
+Roberts et. al. (2017) suggest that blocks should be substantially bigger than the range of spatial autocorrelation (in model residual) to obtain realistic error estimates, while a buffer with the size of the spatial autocorrelation range would result in a good estimation of error.
+
+*Should we increase the block size? This could be gauged by looking at the geographic distances plot below. The block size might be right, when sample-to-prediction and CV distances look similar.*
+
+```{r spatial_blocks_alrm, warning=FALSE}
+k <- 10 # Number of folds
+m <- 1.5 # Multiplier applied to block size
+
+spBlocks_alrM <- cv_spatial(x = GSM,
+                       k = k,
+                       #hexagon = FALSE,
+                       size = sar_alrM * m,
+                       seed = 42,
+                       progress = FALSE)
+```
+
+
+## Reshaping index
+
+The output from the blocking step needs to be reshaped.
+
+```{r reshape_index_alrm}
+index_train_alrM <- list()
+index_val_alrM <- list()
+for (n in 1:spBlocks_alrM$k) {
+  ft <- spBlocks_alrM[["folds_list"]][[n]][[-2]]
+  fv <- spBlocks_alrM[["folds_list"]][[n]][[2]]
+  index_train_alrM[[length(index_train_alrM)+1]] <- ft
+  index_val_alrM[[length(index_val_alrM)+1]] <- fv
+}
+```
+
+
+## Distances in geographic space including CV distances
+
+```{r geogr_space_dist_alrm, warning=FALSE}
+dist_geogr_alrM <- plot_geodist(GSM, predictors,
+                     cvfolds= index_val_alrM,
+                     type = "geo",
+                     unit="km",
+                     showPlot = FALSE)
+
+dist_geogr_alrM$plot
+dist_geogr_alrM$plot + scale_x_log10()
+```
+
+
+## Model tuning
+
+A Random Forest model is tuned. Predictor variables are finally selected in a forward feature selection approach and various values of the mtry parameter are tested in a spatial k-fold cross validation.
+
+This step is time-consuming and memory-heavy. Therefore, only a subset of possible mtry values is tested. These are multiples of the default mtry values or the default values. 
+
+The maximum number of iterations can be calculated upfront, based on the number of pre-selected predictors:
+
+```{r max_iter}
+factorial(length(sel_preds_alrM))/(factorial(2)*factorial(length(sel_preds_alrM)-2)) + sum(c((length(sel_preds_alrM)-2):1))
+```
+
+
+### Forward feature selection
+
+The best combination of predictor variables (features) is found in a forward feature selection process.
+
+```{r model_tuning_alrm}
+nCores <- detectCores()
+cl <- makePSOCKcluster(nCores - 1)
+registerDoParallel(cl)
+
+set.seed(42)
+
+model_alrM <- ffs(seldata_alrM[sel_preds_alrM],
+               seldata_alrM$alrM,
+               metric = "Rsquared",
+               method="rf",
+               replace = FALSE,
+               importance = TRUE,
+               trControl = trainControl(method="CV",
+                                        number = k,
+                                        savePredictions = "final",
+                                        index = index_train_alrM, 
+                                        allowParallel = TRUE),
+               verbose = TRUE)
+
+stopCluster(cl)
+
+model_alrM
+
+sel_preds_alrM <- model_alrM$selectedvars
+```
+
+
+### FFS plots
+
+Plot of R2 over the model runs.
+
+```{r ffs_plot_alrM}
+plot_ffs(model_alrM)
+```
+
+
+## Validation statistics
+
+The validation results of the optimal RF model.
+
+Note that these are the statistics based on the predicted values of the selected model. These differ slightly from the values from the tuning (above), which are the means of the k predictions based on the folds.
+
+```{r validation_stats_alrm}
+t_alrM <- data.frame(model_alrM$pred$pred, model_alrM$pred$obs)
+
+validation_alrM <- data.frame(mse=numeric(), rmse=numeric(), r2=numeric())
+validation_alrM[1,1] <- round(mse(t_alrM$model_alrM.pred.obs, t_alrM$model_alrM.pred.pred), 3)
+validation_alrM[1,2] <- round(rmse(t_alrM$model_alrM.pred.obs, t_alrM$model_alrM.pred.pred), 3)
+validation_alrM[1,3] <- round(cor(t_alrM$model_alrM.pred.obs, t_alrM$model_alrM.pred.pred)^2, 3)
+
+colnames(validation_alrM) <- c("MSE", "RMSE", "r2")
+rownames(validation_alrM) <- NULL
+validation_alrM
+```
+
+
+## Validation plot
+
+```{r validation_plot_alrM, message=FALSE}
+ggplot(t_alrM, aes(x = model_alrM.pred.pred, y = model_alrM.pred.obs)) +
+  geom_hex(bins = 60) +
+  geom_smooth(method = "lm") +
+  geom_abline(intercept = 0, slope = 1, colour = "grey", linewidth = 1.2) +
+  scale_fill_continuous(type = "viridis") +
+  theme_bw() +
+  scale_x_continuous(name = "Predicted value") +
+  scale_y_continuous(name = "Observed value")
+       
+```
+
+
+## Variable importance
+
+```{r variable_importance_plot_alrm}
+imp <- varImp(model_alrM$finalModel)
+imp$Predictor <- rownames(imp)
+rownames(imp) <- NULL
+imp <- imp[order(imp[1], decreasing = TRUE), c(2, 1)]
+colnames(imp)[2] <- "IncMSE"
+imp
+
+impfig <- imp %>%
+  mutate(Predictor = fct_reorder(Predictor, IncMSE)) %>%
+  ggplot( aes(x=Predictor, y=IncMSE)) +
+    geom_bar(stat="identity", fill="#f68060", alpha=.6, width=.4) +
+    coord_flip() +
+    xlab("") +
+    ylab("% increase in MSE") +
+    theme_bw()
+    
+impfig
+```
+
+
+# Predict RF model
+
+## Predict alrM
+
+```{r predict_alr}
+alrM <- rast(predict(stack(predictors[[sel_preds_alrM]]), model_alrM$finalModel))
+```
+
+
+## Area of Applicability
+
+```{r aoa_alrm}
+alrM_trainDI <- trainDI(model = model_alrM,
+                        variables = sel_preds_alrM)
+print(alrM_trainDI)
+
+alrM_aoa <- aoa(newdata = predictors, 
+                model = model_alrM,
+                trainDI = alrM_trainDI,
+                variables = sel_preds_alrM,
+                )
+
+plot(alrM_aoa)
+```
+
+
+## Plot results
+
+```{r plot_results_alrm}
+plot(alrM)
+plot(alrM_aoa$DI)
+plot(alrM_aoa$AOA)
+
+fr <- freq(alrM_aoa$AOA)
+print(paste0("AOA = ", round(100*fr$count[2]/ sum(fr$count),2), "% of pixels"))
+```
+
+
+## Back-transformation
+
+The predicted additive log-ratio is back-transformed to mud contents. Note that this leads to fractional contents ranging between 0 and 1.
+
+```{r back-transform}
+mud <- exp(alrM) / (exp(alrM) + 1)
+
+hist(mud, main = "", xlab = "Mud content (-)")
+```
+
+
+## Plot Mud contents
+
+```{r plot_mud}
+plot(mud)
+```
+
+
+## Export geoTif
+
+```{r geotif}
+writeRaster(mud, paste0("output/mud_", Sys.Date(), ".tif"), overwrite = TRUE)
+```
+
+
+## Output a log file
+
+```{r log}
+sink(file = paste0("output/ModelLog_alrM_", Sys.Date(), ".txt"))
+print("Selected Predictors")
+sel_preds_alrM
+model_alrM
+print("Final Model")
+paste0("MSE = ", validation_alrM[1,1])
+paste0("RMSE = ", validation_alrM[1,2])
+paste0("R2 = ", validation_alrM[1,3])
+paste0("AOA = ", round(100*fr$count[2]/ sum(fr$count),2), "% of pixels")
+sink()
+```
+
+
+# Finishing off
+
+## Save session info
+
+```{r save_session_info}
+sessionInfo <- sessionInfo()
+save(sessionInfo, file = "sessionInfo.Rdata")
+rm("sessionInfo")
+```
+
+
+## Save global environment
+
+```{r save_global_env}
+save.image(file = "globEnv.RData")
+```
